@@ -13,7 +13,11 @@ from fastapi.responses import JSONResponse
 from app.api.routes import bots, health, ips, lab, proxies, reports, websites
 from app.config import settings
 from app.core.logging import logger
-from app.core.security import SSRFValidationError, sanitize_credentials
+from app.core.security import (
+    ResponseSizeLimitExceeded,
+    SSRFValidationError,
+    sanitize_credentials,
+)
 from app.database import init_db
 
 # Simple in-memory token bucket rate limiter for API endpoints
@@ -83,6 +87,11 @@ async def rate_limit_and_telemetry_middleware(request: Request, call_next):
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"error": "SSRF Security Validation Failed", "detail": str(e)}
         )
+    except ResponseSizeLimitExceeded as e:
+        return JSONResponse(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            content={"error": "Response Size Limit Exceeded", "detail": str(e)}
+        )
     except Exception as exc:
         safe_msg = sanitize_credentials(str(exc))
         logger.error(f"Unhandled exception on {request.url.path}: {safe_msg}")
@@ -100,14 +109,3 @@ app.include_router(bots.router, prefix="/api")
 app.include_router(proxies.router, prefix="/api")
 app.include_router(lab.router, prefix="/api")
 app.include_router(reports.router, prefix="/api")
-
-
-@app.get("/")
-def root():
-    return {
-        "platform": settings.app_name,
-        "tagline": "Understand. Detect. Defend.",
-        "version": settings.app_version,
-        "docs": "/api/docs",
-        "health": "/api/health",
-    }

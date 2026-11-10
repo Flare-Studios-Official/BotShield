@@ -7,7 +7,7 @@ secure defaults, and strict validation for defensive operations.
 import os
 from pathlib import Path
 from typing import List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 try:
     from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -30,14 +30,22 @@ class Settings(BaseSettings):
     # Host & Port
     api_host: str = os.getenv("BOTSHIELD_HOST", "127.0.0.1")
     api_port: int = int(os.getenv("BOTSHIELD_PORT", "8000"))
-    cors_origins: List[str] = [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-    ]
+    cors_origins: List[str] = (
+        [o.strip() for o in os.getenv("BOTSHIELD_CORS_ORIGINS", "").split(",") if o.strip()]
+        if os.getenv("BOTSHIELD_CORS_ORIGINS")
+        else [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+        ]
+    )
+
+    # Authentication & API Security
+    admin_api_key: str = os.getenv("BOTSHIELD_ADMIN_API_KEY", "")
+    ingest_api_key: str = os.getenv("BOTSHIELD_INGEST_API_KEY", "")
 
     # Database
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///./botshield.db")
