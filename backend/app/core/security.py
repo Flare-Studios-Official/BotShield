@@ -1,14 +1,33 @@
 """BotShield Security Core Module
 
-Provides SSRF defense, IP address classification, DNS re-validation,
-credential redaction, and safe outbound connection validation.
+Provides enterprise SSRF defense, IP address classification, DNS re-validation,
+connection-level IP pinning, streaming response-body limits, credential redaction,
+and administrative API authorization.
 """
 
+import hmac
 import ipaddress
+import logging
 import re
 import socket
-from typing import Optional, Tuple
+import typing
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+import httpcore
+from httpcore._backends.sync import SyncBackend, SyncStream
+from httpcore._exceptions import (
+    ConnectError,
+    ConnectTimeout,
+    ExceptionMapping,
+    map_exceptions,
+)
+import httpx
+from fastapi import Header, HTTPException, status
+
+from app.config import settings
+
+logger = logging.getLogger("botshield.security")
 
 # Restricted / Dangerous ports commonly used for internal services
 BLOCKED_PORTS = {
@@ -56,6 +75,11 @@ class SSRFValidationError(ValueError):
     pass
 
 
+class ResponseSizeLimitExceeded(ValueError):
+    """Raised when an outbound HTTP response body exceeds configured size limits."""
+    pass
+
+
 def is_ip_private_or_reserved(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> Tuple[bool, str]:
     """Inspects an IP address and determines if it is private, reserved, loopback, or cloud metadata.
 
@@ -92,6 +116,10 @@ def is_ip_private_or_reserved(ip: ipaddress.IPv4Address | ipaddress.IPv6Address)
 
     # Specific IPv4 checks
     if isinstance(ip, ipaddress.IPv4Address):
+        # 0.0.0.0/8 current network
+        if ip in ipaddress.IPv4Network("0.0.0.0/8"):
+            return True, "Broadcast / This-Network address block (0.0.0.0/8)"
+
         # Carrier Grade NAT: 100.64.0.0/10
         cgnat = ipaddress.IPv4Network("100.64.0.0/10")
         if ip in cgnat:
@@ -102,18 +130,22 @@ def is_ip_private_or_reserved(ip: ipaddress.IPv4Address | ipaddress.IPv6Address)
             if ip in ipaddress.IPv4Network(doc_net):
                 return True, "Test / Documentation network (TEST-NET)"
 
+        # 240.0.0.0/4 Class E / Reserved
+        if ip in ipaddress.IPv4Network("240.0.0.0/4"):
+            return True, "Class E / Reserved address block (240.0.0.0/4)"
+
     return False, "Public routable address"
 
 
 def validate_and_resolve_url(
     url: str,
     allow_private: bool = False,
-    allow_custom_ports: bool = False
+    allow_custom_ports: bool = False,
 ) -> Tuple[str, str, int, str]:
     """Validates a target URL against SSRF rules and resolves DNS safely.
 
     Returns:
-        (clean_url, resolved_ip, port, hostname)
+        (clean_url, primary_raw_ip, port, hostname)
     Raises:
         SSRFValidationError on any violation.
     """
@@ -151,7 +183,6 @@ def validate_and_resolve_url(
     if not allow_custom_ports and port not in (80, 443):
         if port in BLOCKED_PORTS:
             raise SSRFValidationError(f"Port {port} is restricted to prevent lateral internal service access.")
-        # Non-standard ports warning or rejection
         if port < 80 or port > 65535:
             raise SSRFValidationError(f"Invalid TCP port {port}.")
 
@@ -192,6 +223,143 @@ def validate_and_resolve_url(
     return clean_url, primary_raw_ip, port, hostname
 
 
+class SSRFPinnedSyncBackend(SyncBackend):
+    """Custom httpcore NetworkBackend that pins outbound TCP connections to validated IPs.
+
+    Guarantees that the exact IP validated by SSRF controls is used for the TCP connection,
+    completely preventing DNS rebinding and Time-Of-Check / Time-Of-Use (TOCTOU) attacks,
+    while preserving TLS SNI and server certificate validation against the original hostname.
+    """
+
+    def __init__(self, pinned_hosts: Dict[str, str], allow_private: bool = False):
+        super().__init__()
+        self.pinned_hosts = {k.lower(): v for k, v in pinned_hosts.items()}
+        self.allow_private = allow_private
+
+    def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: typing.Iterable[Any] | None = None,
+    ) -> SyncStream:
+        host_lower = host.lower()
+        if host_lower in self.pinned_hosts:
+            target_ip = self.pinned_hosts[host_lower]
+        else:
+            # Inline defensive validation if host was not pre-pinned
+            _, target_ip, _, _ = validate_and_resolve_url(
+                f"http://{host}:{port}",
+                allow_private=self.allow_private,
+                allow_custom_ports=True,
+            )
+            self.pinned_hosts[host_lower] = target_ip
+
+        # Re-verify destination IP directly before socket creation
+        if not self.allow_private:
+            ip_obj = ipaddress.ip_address(target_ip)
+            disallowed, reason = is_ip_private_or_reserved(ip_obj)
+            if disallowed:
+                raise SSRFValidationError(
+                    f"Connection blocked: Destination IP {target_ip} is disallowed ({reason})."
+                )
+
+        address = (target_ip, port)
+        source_address = None if local_address is None else (local_address, 0)
+        exc_map: ExceptionMapping = {
+            socket.timeout: ConnectTimeout,
+            OSError: ConnectError,
+        }
+        if socket_options is None:
+            socket_options = []
+
+        with map_exceptions(exc_map):
+            sock = socket.create_connection(
+                address,
+                timeout,
+                source_address=source_address,
+            )
+            for option in socket_options:
+                sock.setsockopt(*option)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        return SyncStream(sock)
+
+
+class SSRFPinnedTransport(httpx.HTTPTransport):
+    """HTTPX Transport backed by SSRFPinnedSyncBackend to pin verified destination IPs."""
+
+    def __init__(self, pinned_hosts: Dict[str, str], allow_private: bool = False, **kwargs):
+        super().__init__(**kwargs)
+        backend = SSRFPinnedSyncBackend(pinned_hosts=pinned_hosts, allow_private=allow_private)
+        self._pool = httpcore.ConnectionPool(
+            ssl_context=self._pool._ssl_context,
+            network_backend=backend,
+            http1=True,
+            http2=False,
+            retries=0,
+        )
+
+
+def create_pinned_client(
+    pinned_hosts: Dict[str, str],
+    allow_private: bool = False,
+    timeout: float = 8.0,
+) -> httpx.Client:
+    """Creates an httpx.Client with IP pinning enabled for the specified hosts."""
+    transport = SSRFPinnedTransport(pinned_hosts=pinned_hosts, allow_private=allow_private)
+    return httpx.Client(
+        transport=transport,
+        timeout=timeout,
+        follow_redirects=False,  # Redirects must be traversed manually to re-verify IPs
+    )
+
+
+def stream_safe_get(
+    client: httpx.Client,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    max_bytes: int = 2 * 1024 * 1024,
+    timeout: Optional[float] = None,
+) -> Tuple[httpx.Response, bytes]:
+    """Performs an HTTP GET request with streaming enforcement of maximum response size.
+
+    Immediately terminates the download if Content-Length or streamed chunks exceed max_bytes.
+    Returns:
+        (response_metadata, response_content_bytes)
+    Raises:
+        ResponseSizeLimitExceeded if response size limit is breached.
+        httpx.HTTPError on network failures.
+    """
+    req_headers = dict(headers) if headers else {}
+
+    with client.stream("GET", url, headers=req_headers, timeout=timeout) as resp:
+        # Pre-check Content-Length header if present
+        cl_header = resp.headers.get("content-length")
+        if cl_header and cl_header.strip().isdigit():
+            cl_val = int(cl_header.strip())
+            if cl_val > max_bytes:
+                raise ResponseSizeLimitExceeded(
+                    f"Response Content-Length ({cl_val} bytes) exceeds maximum limit ({max_bytes} bytes)."
+                )
+
+        chunks: List[bytes] = []
+        total_downloaded = 0
+        for chunk in resp.iter_bytes(chunk_size=16384):
+            total_downloaded += len(chunk)
+            if total_downloaded > max_bytes:
+                raise ResponseSizeLimitExceeded(
+                    f"Response body exceeded maximum allowed limit ({max_bytes} bytes). Transfer aborted."
+                )
+            chunks.append(chunk)
+
+        body_bytes = b"".join(chunks)
+        # Populate response _content so caller can use resp.text / resp.json() normally
+        resp._content = body_bytes
+        return resp, body_bytes
+
+
 def sanitize_credentials(text: str) -> str:
     """Redacts passwords, tokens, and basic auth credentials from URLs and strings."""
     if not text:
@@ -203,3 +371,42 @@ def sanitize_credentials(text: str) -> str:
     # Redact common key patterns
     redacted = re.sub(r"(api[_-]?key[\"']?\s*[:=]\s*[\"']?)[A-Za-z0-9_\-\.]{8,}", r"\1[REDACTED]", redacted, flags=re.IGNORECASE)
     return redacted
+
+
+def require_admin_auth(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None),
+) -> bool:
+    """FastAPI security dependency protecting administrative configuration and review endpoints.
+
+    In production environments, rejects access with 403 Forbidden if no admin API key is configured.
+    When configured, verifies the presented key using constant-time comparison.
+    """
+    configured_key = settings.admin_api_key.strip()
+
+    if configured_key:
+        token = x_api_key
+        if not token and authorization:
+            if authorization.startswith("Bearer "):
+                token = authorization[7:].strip()
+            else:
+                token = authorization.strip()
+
+        if not token or not hmac.compare_digest(token, configured_key):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing administrative API key.",
+                headers={"WWW-Authenticate": "ApiKey"},
+            )
+        return True
+
+    # When deployed in production without an admin key configured, fail closed
+    if settings.environment.lower() == "production":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Administrative endpoints are disabled in production until BOTSHIELD_ADMIN_API_KEY is configured.",
+        )
+
+    # In development mode with no key set, log warning and permit local access
+    logger.debug("Administrative endpoint accessed without BOTSHIELD_ADMIN_API_KEY (development mode).")
+    return True

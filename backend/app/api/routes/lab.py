@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.core.security import require_admin_auth
 from app.database import get_db
 from app.schemas.lab import LabScenarioStartRequest
 from app.services.traffic_simulator import reset_lab_events, run_lab_scenario
@@ -36,8 +37,14 @@ def execute_lab_simulation(payload: LabScenarioStartRequest, db: Session = Depen
 
 
 @router.post("/reset")
-def clear_lab_telemetry(db: Session = Depends(get_db)):
-    """Clears demonstration lab events while preserving real production telemetry."""
+def clear_lab_telemetry(
+    auth: bool = Depends(require_admin_auth),
+    db: Session = Depends(get_db),
+):
+    """Clears demonstration lab events while preserving real production telemetry.
+
+    Requires administrative authentication.
+    """
     deleted_count = reset_lab_events(db=db)
     return {
         "status": "success",

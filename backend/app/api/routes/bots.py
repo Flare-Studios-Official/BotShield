@@ -1,10 +1,12 @@
 """Bot Detection and Telemetry API Routes."""
 
 import json
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import List, Optional
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from app.config import settings
+from app.core.security import require_admin_auth
 from app.database import get_db, utc_now
 from app.models.schema_models import (
     BotDetectionResult,
@@ -31,8 +33,18 @@ router = APIRouter(prefix="/bots", tags=["Bot Detection"])
 
 
 @router.post("/events", response_model=BotEventSchema)
-def ingest_telemetry_event(payload: BotEventCreate, db: Session = Depends(get_db)):
-    """Ingests a live HTTP telemetry event and triggers immediate behavioral evaluation."""
+def ingest_telemetry_event(
+    payload: BotEventCreate,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    db: Session = Depends(get_db),
+):
+    """Ingests an HTTP telemetry event and triggers immediate behavioral evaluation.
+
+    If BOTSHIELD_INGEST_API_KEY is configured in the environment, verifies the key.
+    """
+    if settings.ingest_api_key and (not x_api_key or x_api_key != settings.ingest_api_key):
+        raise HTTPException(status_code=401, detail="Invalid or missing telemetry ingest key.")
+
     ev = record_bot_event(payload, db=db)
     # Trigger background evaluation on the source IP
     evaluate_ip_behavior(payload.source_ip, db=db)
@@ -120,9 +132,13 @@ def list_detection_rules(db: Session = Depends(get_db)):
 def update_detection_rule(
     rule_id: str,
     payload: DetectionRuleUpdate,
+    auth: bool = Depends(require_admin_auth),
     db: Session = Depends(get_db),
 ):
-    """Updates detection rule scoring weights, thresholds, or enabled toggle."""
+    """Updates detection rule scoring weights, thresholds, or enabled toggle.
+
+    Requires administrative authentication.
+    """
     rule = db.query(DetectionRuleConfig).filter(DetectionRuleConfig.id == rule_id).first()
     if not rule:
         raise HTTPException(status_code=404, detail="Detection rule not found.")
@@ -153,9 +169,13 @@ def update_detection_rule(
 def review_detection_record(
     detection_id: str,
     payload: ReviewDetectionRequest,
+    auth: bool = Depends(require_admin_auth),
     db: Session = Depends(get_db),
 ):
-    """Records human analyst review and false-positive determination."""
+    """Records human analyst review and false-positive determination.
+
+    Requires administrative authentication.
+    """
     det = db.query(BotDetectionResult).filter(BotDetectionResult.id == detection_id).first()
     if not det:
         raise HTTPException(status_code=404, detail="Detection record not found.")
