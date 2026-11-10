@@ -5,12 +5,11 @@ demonstration endpoints to benchmark behavioral detection rules.
 """
 
 import random
-import time
 from typing import Any, Dict, List
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import SessionLocal, utc_now
+from app.database import SessionLocal
 from app.models.schema_models import BotEvent
 from app.schemas.bot import BotDetectionResultSchema, BotEventCreate
 from app.services.bot_detector import evaluate_ip_behavior, record_bot_event
@@ -58,10 +57,10 @@ def run_lab_scenario(
         events_created: List[BotEvent] = []
 
         if scenario == "normal_browser":
-            # Normal browser behavior: realistic intervals, standard headers, mostly 200 OK
-            ua = random.choice(NORMAL_USER_AGENTS)
-            for i in range(min(request_count, 15)):
+            # Human browsing: standard UAs, organic path navigation, 200 OKs
+            for _ in range(request_count):
                 path = random.choice(NORMAL_PATHS)
+                ua = random.choice(NORMAL_USER_AGENTS)
                 ev = record_bot_event(
                     BotEventCreate(
                         source_ip=source_ip,
@@ -69,8 +68,8 @@ def run_lab_scenario(
                         path=path,
                         user_agent=ua,
                         response_status=200,
-                        duration_ms=round(random.uniform(45.0, 150.0), 2),
-                        session_id="lab-session-normal-101",
+                        duration_ms=round(random.uniform(40.0, 180.0), 2),
+                        session_id="human-session-abc",
                         is_lab_traffic=True,
                         lab_scenario="normal_browser",
                     ),
@@ -79,10 +78,10 @@ def run_lab_scenario(
                 events_created.append(ev)
 
         elif scenario == "automated_scraper":
-            # Scraper using automation UA, high velocity, programmatic intervals
+            # Programmatic scraper: python-requests, sequential query parameters
             ua = "python-requests/2.31.0"
             for i in range(request_count):
-                path = f"/api/products?page={i + 1}"
+                path = f"/api/catalog?page={i + 1}&limit=50"
                 ev = record_bot_event(
                     BotEventCreate(
                         source_ip=source_ip,
@@ -100,19 +99,18 @@ def run_lab_scenario(
                 events_created.append(ev)
 
         elif scenario == "burst_bot":
-            # High burst: rapid cluster within sub-second intervals
-            ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HeadlessChrome/120.0"
-            for i in range(max(request_count, 20)):
-                path = "/checkout/voucher" if i % 2 == 0 else "/api/inventory"
+            # High-velocity burst: curl client hammering single checkout/login endpoint
+            ua = "curl/8.4.0"
+            for _ in range(request_count):
                 ev = record_bot_event(
                     BotEventCreate(
                         source_ip=source_ip,
-                        http_method="POST" if i % 2 == 0 else "GET",
-                        path=path,
+                        http_method="POST",
+                        path="/api/checkout/cart",
                         user_agent=ua,
-                        response_status=200 if i < 15 else 429,
-                        duration_ms=round(random.uniform(5.0, 20.0), 2),
-                        session_id="burst-session-99",
+                        response_status=random.choice([200, 429]),
+                        duration_ms=round(random.uniform(5.0, 15.0), 2),
+                        session_id="",
                         is_lab_traffic=True,
                         lab_scenario="burst_bot",
                     ),
@@ -121,19 +119,21 @@ def run_lab_scenario(
                 events_created.append(ev)
 
         elif scenario == "endpoint_enumeration":
-            # Scanner: many sensitive paths, mostly 404 responses
-            ua = "sqlmap/1.7#stable"
-            for i in range(request_count):
-                path = ENUMERATION_PATHS[i % len(ENUMERATION_PATHS)]
-                status = 404 if i % 5 != 0 else 403
+            # Vulnerability scanner: probing sensitive files, receiving 404s
+            ua = "Mozilla/5.0 (compatible; SecurityScanner/2.1)"
+            paths_to_probe = ENUMERATION_PATHS[:request_count]
+            if len(paths_to_probe) < request_count:
+                paths_to_probe.extend([f"/backup_{i}.sql" for i in range(request_count - len(paths_to_probe))])
+
+            for p in paths_to_probe:
                 ev = record_bot_event(
                     BotEventCreate(
                         source_ip=source_ip,
                         http_method="GET",
-                        path=path,
+                        path=p,
                         user_agent=ua,
-                        response_status=status,
-                        duration_ms=round(random.uniform(15.0, 40.0), 2),
+                        response_status=404,
+                        duration_ms=round(random.uniform(15.0, 45.0), 2),
                         session_id="",
                         is_lab_traffic=True,
                         lab_scenario="endpoint_enumeration",
@@ -187,6 +187,6 @@ def run_lab_scenario(
 
 def reset_lab_events(db: Session) -> int:
     """Removes only lab-generated demonstration telemetry, preserving real production data."""
-    deleted_count = db.query(BotEvent).filter(BotEvent.is_lab_traffic == True).delete()
+    deleted_count = db.query(BotEvent).filter(BotEvent.is_lab_traffic.is_(True)).delete()
     db.commit()
     return deleted_count
