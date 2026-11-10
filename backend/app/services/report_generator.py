@@ -183,3 +183,106 @@ def generate_audit_pdf(scan_data: Dict[str, Any], output_path: Path) -> Path:
 
     doc.build(story)
     return output_path
+
+def generate_json_report(data: Dict[str, Any]) -> str:
+    """Convert report data into a formatted JSON string."""
+    return json.dumps(data, indent=2, ensure_ascii=False, default=str)
+
+
+def generate_pdf_report(
+    title: str,
+    target: str,
+    category: str,
+    score: int,
+    findings: list[Dict[str, Any]],
+    metadata: Dict[str, Any],
+) -> bytes:
+    """Generate a PDF report and return its contents as bytes."""
+    from io import BytesIO
+    from xml.sax.saxutils import escape
+
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        rightMargin=36,
+        leftMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+    )
+
+    styles = getSampleStyleSheet()
+    story = [
+        Paragraph(escape(str(title)), styles["Title"]),
+        Paragraph(
+            f"<b>Category:</b> {escape(str(category))}",
+            styles["Normal"],
+        ),
+        Paragraph(
+            f"<b>Target:</b> {escape(str(target))}",
+            styles["Normal"],
+        ),
+        Paragraph(
+            f"<b>Security score:</b> {escape(str(score))} / 100",
+            styles["Normal"],
+        ),
+        Spacer(1, 16),
+        Paragraph("Assessment Details", styles["Heading2"]),
+    ]
+
+    rows = [["Field", "Value"]]
+    for key, value in metadata.items():
+        rows.append([
+            escape(str(key)),
+            Paragraph(
+                escape(str(value if value is not None else "N/A")),
+                styles["BodyText"],
+            ),
+        ])
+
+    table = Table(rows, colWidths=[150, 390], repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("PADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.extend([
+        table,
+        Spacer(1, 16),
+        Paragraph("Security Findings", styles["Heading2"]),
+    ])
+
+    if not findings:
+        story.append(
+            Paragraph("No findings were recorded.", styles["BodyText"])
+        )
+
+    for index, finding in enumerate(findings, 1):
+        name = escape(str(finding.get("name") or "Finding"))
+        severity = escape(
+            str(finding.get("severity") or "INFO").upper()
+        )
+
+        story.append(Paragraph(
+            f"<b>{index}. {name} [{severity}]</b>",
+            styles["Heading3"],
+        ))
+
+        for label, key in [
+            ("Observed", "observed_value"),
+            ("Description", "description"),
+            ("Recommendation", "recommendation"),
+        ]:
+            value = finding.get(key)
+            if value:
+                story.append(Paragraph(
+                    f"<b>{label}:</b> {escape(str(value))}",
+                    styles["BodyText"],
+                ))
+
+        story.append(Spacer(1, 8))
+
+    doc.build(story)
+    return buffer.getvalue()
