@@ -15,8 +15,10 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.core.logging import logger
 from app.core.security import (
+    ResponseSizeLimitExceeded,
     SSRFValidationError,
     sanitize_credentials,
+    stream_safe_get,
     validate_and_resolve_url,
 )
 from app.models.schema_models import ProxyTestRecord
@@ -73,21 +75,18 @@ def test_proxy_endpoint(
     error_msg = ""
     egress_class = "Unknown"
 
-    # Redact credentials for logging & database storage
-    safe_proxy_display = sanitize_credentials(clean_proxy)
-
     try:
-        # Build HTTPX client with proxy mount
-        proxies = {
-            "http://": clean_proxy,
-            "https://": clean_proxy,
-        }
         with httpx.Client(
             proxy=clean_proxy,
             timeout=settings.http_timeout_seconds,
             verify=True
         ) as client:
-            resp = client.get(test_target)
+            resp, body_bytes = stream_safe_get(
+                client=client,
+                url=test_target,
+                max_bytes=128 * 1024,
+                timeout=settings.http_timeout_seconds,
+            )
             latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
             if resp.status_code == 200:
@@ -103,6 +102,11 @@ def test_proxy_endpoint(
             else:
                 error_msg = f"Target responded with HTTP {resp.status_code}"
 
+    except ResponseSizeLimitExceeded as e:
+        latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        error_msg = f"Egress test payload exceeded size limits: {e}"
+        logger.debug(f"Proxy test size limit exceeded: {error_msg}")
+
     except Exception as e:
         latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
         error_msg = sanitize_credentials(str(e))
@@ -113,9 +117,12 @@ def test_proxy_endpoint(
         try:
             ip_eval = analyze_ip_address(egress_ip, db=None)
             tags = []
-            if ip_eval.is_datacenter: tags.append("Datacenter")
-            if ip_eval.is_vpn: tags.append("VPN")
-            if ip_eval.is_tor: tags.append("Tor Exit")
+            if ip_eval.is_datacenter:
+                tags.append("Datacenter")
+            if ip_eval.is_vpn:
+                tags.append("VPN")
+            if ip_eval.is_tor:
+                tags.append("Tor Exit")
             if ip_eval.as_org and ip_eval.as_org != "Unknown":
                 tags.append(ip_eval.as_org)
             egress_class = " / ".join(tags) if tags else "Residential / Broadband"
