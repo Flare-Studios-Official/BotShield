@@ -1,9 +1,20 @@
 # BotShield REST API Reference
 
-The BotShield API provides programmatic access to defensive scanning, IP intelligence lookups, telemetry ingestion, and report generation.
+The BotShield API provides programmatic access to defensive scanning, IP intelligence lookups, telemetry ingestion, detection rule configuration, and report generation.
 
-Interactive Swagger documentation is available locally at:
+Interactive OpenAPI Swagger documentation is available locally at:
 `http://127.0.0.1:8000/api/docs`
+
+---
+
+## Authentication & Authorization
+
+Public and read-only endpoints do not require authentication by default.
+
+Administrative endpoints (rule modifications, false-positive reviews, and telemetry resets) are protected by administrative authorization:
+* **Header**: `X-API-Key: <BOTSHIELD_ADMIN_API_KEY>` or `Authorization: Bearer <BOTSHIELD_ADMIN_API_KEY>`
+* **Production Behavior**: When `BOTSHIELD_ENV=production`, administrative endpoints fail closed (HTTP 403) unless `BOTSHIELD_ADMIN_API_KEY` is configured.
+* **Telemetry Ingest Key**: When `BOTSHIELD_INGEST_API_KEY` is configured, telemetry ingestion (`POST /api/bots/events`) requires the corresponding `X-API-Key` header.
 
 ---
 
@@ -29,7 +40,7 @@ Returns system operational status, database connectivity, and environment settin
 ## Website Security Scanner
 
 ### `POST /api/websites/scan`
-Executes a passive security inspection against a target URL.
+Executes an SSRF-safe passive security inspection against a target URL. Outbound connections are pinned directly to the resolved IP to prevent DNS rebinding.
 
 **Request:**
 ```json
@@ -73,7 +84,7 @@ Executes a passive security inspection against a target URL.
 ## IP Intelligence
 
 ### `POST /api/ips/analyze`
-Analyzes an IPv4 or IPv6 address.
+Analyzes an IPv4 or IPv6 address using multi-RIR RDAP discovery, reverse DNS, and live threat intelligence feeds.
 
 **Request:**
 ```json
@@ -98,8 +109,12 @@ Analyzes an IPv4 or IPv6 address.
   "is_datacenter": true,
   "is_vpn": false,
   "is_tor": false,
-  "reputation_score": 15,
-  "threat_level": "low"
+  "reputation_score": 5,
+  "threat_level": "low",
+  "provider_sources": {
+    "rdap": "ARIN RDAP",
+    "ipinfo": "IPinfo Geolocation & Privacy API"
+  }
 }
 ```
 
@@ -124,10 +139,44 @@ Records an inbound HTTP request event and triggers behavioral evaluation.
 
 ---
 
+## Administrative Detection Rules
+
+### `GET /api/bots/rules`
+Lists all active behavioral detection rules, weights, and threshold values.
+
+### `PUT /api/bots/rules/{rule_id}`
+Updates scoring weights, thresholds, or enables/disables a rule. **Requires administrative authorization.**
+
+**Request:**
+```json
+{
+  "weight": 30,
+  "threshold_value": 25.0,
+  "enabled": true
+}
+```
+
+---
+
+## Proxy Intelligence & Diagnostics
+
+### `POST /api/proxies/test`
+Audits connectivity and egress characteristics of user-authorized HTTP, HTTPS, or SOCKS5 proxies.
+
+**Request:**
+```json
+{
+  "proxy_url": "socks5://proxy.example.com:1080",
+  "target_url": "https://api.ipify.org?format=json"
+}
+```
+
+---
+
 ## Detection Lab
 
 ### `POST /api/lab/run`
-Triggers an isolated local traffic simulation.
+Triggers an isolated local traffic simulation against local endpoints.
 
 **Request:**
 ```json
@@ -139,4 +188,4 @@ Triggers an isolated local traffic simulation.
 ```
 
 ### `POST /api/lab/reset`
-Clears demonstration events without altering production logs.
+Clears demonstration events without altering production logs. **Requires administrative authorization.**

@@ -48,12 +48,14 @@ node_modules/
 coverage/
 dist/
 dist-ssr/
-*.local
+.ruff_cache/
 
-# Editor & OS artifacts
+# IDE / Editor artifacts
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# OS generated files
 .DS_Store
 Thumbs.db

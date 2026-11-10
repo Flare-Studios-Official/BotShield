@@ -53,6 +53,8 @@ Outbound request safety is guaranteed through a non-bypassable four-phase valida
 2. **Pre-Resolution Hostname Scrubbing**: Disallows localhost aliases (`localhost`, `ip6-localhost`, `127.0.0.1`) and cloud metadata names (`metadata.google.internal`).
 3. **DNS Resolution & Exhaustive IP Parsing**: Resolves target hostnames using `socket.getaddrinfo` and inspects **all** returned A and AAAA records against RFC 1918 (Private), RFC 3927 (Link-local), RFC 5737 (Documentation), RFC 6598 (CGNAT), and cloud metadata ranges (`169.254.169.254`, `fd00:ec2::254`).
 4. **Hop-by-Hop Redirect Re-Validation**: Prevents redirect-based SSRF by manually disabling automatic client redirects and re-executing full DNS and IP validation on every subsequent `Location` header destination.
+5. **Connection-Level IP Pinning & DNS Rebinding Elimination**: Employs a custom `httpcore` network backend (`SSRFPinnedSyncBackend`) that pins the outbound socket connection directly to the pre-validated destination IP. No secondary DNS resolution occurs during connection establishment, completely eliminating Time-of-Check / Time-of-Use (TOCTOU) DNS rebinding, while maintaining TLS SNI and peer certificate verification against the target hostname.
+6. **Streaming Response Body Limits**: All outbound HTTP operations stream chunks up to `max_response_body_bytes` (default 2 MB) and immediately abort transfers if limits are exceeded, preventing memory exhaustion attacks.
 
 ---
 

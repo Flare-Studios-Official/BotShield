@@ -1,11 +1,11 @@
 """Integration tests for BotShield FastAPI endpoints."""
 
-import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.orm import sessionmaker
 
+from app.config import settings
 from app.database import Base, get_db
 from app.main import app
 from app.models.schema_models import DetectionRuleConfig
@@ -93,6 +93,17 @@ def test_bot_telemetry_and_summary_endpoint():
     assert summary["total_events"] >= 1
 
 
+def test_invalid_telemetry_source_ip_rejected():
+    """Malformed or garbage IP in telemetry is rejected at schema level with 422."""
+    payload = {
+        "source_ip": "invalid-ip-string",
+        "http_method": "GET",
+        "path": "/",
+    }
+    resp = client.post("/api/bots/events", json=payload)
+    assert resp.status_code == 422
+
+
 def test_detection_rules_list():
     response = client.get("/api/bots/rules")
     assert response.status_code == 200
@@ -110,3 +121,69 @@ def test_lab_simulation_and_reset():
     reset_resp = client.post("/api/lab/reset")
     assert reset_resp.status_code == 200
     assert reset_resp.json()["status"] == "success"
+
+
+def test_admin_auth_protection():
+    """Ensures administrative endpoints require authentication when admin_api_key is configured."""
+    original_key = settings.admin_api_key
+    try:
+        settings.admin_api_key = "test-secret-key-12345"
+
+        # 1. Without header -> 401 Unauthorized
+        unauth_resp = client.put(
+            "/api/bots/rules/HIGH_FREQUENCY",
+            json={"weight": 35}
+        )
+        assert unauth_resp.status_code == 401
+
+        # 2. With wrong key -> 401 Unauthorized
+        wrong_resp = client.put(
+            "/api/bots/rules/HIGH_FREQUENCY",
+            json={"weight": 35},
+            headers={"X-API-Key": "wrong-key"}
+        )
+        assert wrong_resp.status_code == 401
+
+        # 3. With correct X-API-Key -> 200 OK
+        ok_resp = client.put(
+            "/api/bots/rules/HIGH_FREQUENCY",
+            json={"weight": 35},
+            headers={"X-API-Key": "test-secret-key-12345"}
+        )
+        assert ok_resp.status_code == 200
+        assert ok_resp.json()["weight"] == 35
+
+        # 4. With Authorization Bearer -> 200 OK
+        bearer_resp = client.put(
+            "/api/bots/rules/HIGH_FREQUENCY",
+            json={"weight": 25},
+            headers={"Authorization": "Bearer test-secret-key-12345"}
+        )
+        assert bearer_resp.status_code == 200
+        assert bearer_resp.json()["weight"] == 25
+
+        # 5. Lab reset without key -> 401
+        reset_unauth = client.post("/api/lab/reset")
+        assert reset_unauth.status_code == 401
+
+        # 6. Lab reset with key -> 200
+        reset_ok = client.post("/api/lab/reset", headers={"X-API-Key": "test-secret-key-12345"})
+        assert reset_ok.status_code == 200
+    finally:
+        settings.admin_api_key = original_key
+
+
+def test_admin_auth_production_fail_closed():
+    """In production environment without admin key configured, administrative endpoints return 403."""
+    original_env = settings.environment
+    original_key = settings.admin_api_key
+    try:
+        settings.environment = "production"
+        settings.admin_api_key = ""
+
+        resp = client.post("/api/lab/reset")
+        assert resp.status_code == 403
+        assert "disabled in production" in resp.json()["detail"]
+    finally:
+        settings.environment = original_env
+        settings.admin_api_key = original_key
